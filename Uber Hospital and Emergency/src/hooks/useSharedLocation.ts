@@ -71,17 +71,22 @@ export const useSharedLocation = (storageKey = DEFAULT_STORAGE_KEY) => {
   };
 
   const requestGPS = async (options?: { silent?: boolean; showAlert?: boolean }): Promise<SavedLocation | null> => {
+    let timeoutMs = 12000; // Default 12 seconds for normal connections
     try {
       if (navigator.permissions) {
         const perm = await navigator.permissions.query({ name: 'geolocation' });
+        
+        // If it's a first time prompt, give them 60 full seconds to read the browser popup!
+        if (perm.state === 'prompt') {
+          timeoutMs = 60000;
+          if (options?.silent) return null;
+        }
+
         if (perm.state === 'denied') {
           setLocStatus('denied');
           if (!options?.silent && options?.showAlert !== false) {
             alert('Location is blocked. Please click the Lock icon 🔒 in your browser URL bar to allow location access, then try again.');
           }
-          return null;
-        }
-        if (perm.state === 'prompt' && options?.silent) {
           return null;
         }
       }
@@ -109,7 +114,7 @@ export const useSharedLocation = (storageKey = DEFAULT_STORAGE_KEY) => {
           }
           resolve(null);
         },
-        { timeout: 8000, enableHighAccuracy: true }
+        { timeout: timeoutMs, enableHighAccuracy: true }
       );
     });
   };
