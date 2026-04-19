@@ -1,1 +1,0 @@
-# Arogya-google-solution-challenge
