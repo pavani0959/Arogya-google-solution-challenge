@@ -67,7 +67,7 @@ export const LandingPage = () => {
           {/* I Can Help */}
           <button
             id="btn-can-help"
-            onClick={() => nav('/app/helper')}
+            onClick={() => nav('/login?redirect=/app/help')}
             className="relative w-full flex items-center justify-center gap-3 rounded-2xl py-5 text-base font-black text-white overflow-hidden transition-all active:scale-95"
             style={{ background: 'linear-gradient(135deg, #1d4ed8, #1e3a8a)', boxShadow: '0 0 30px rgba(29,78,216,0.35), 0 4px 20px rgba(0,0,0,0.4)' }}
           >

@@ -1,9 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { HandHeart, CheckCircle2, Clock, MapPin, Search } from 'lucide-react';
+import { HandHeart, CheckCircle2, Clock, MapPin, Search, AlertTriangle } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useAuth } from '../../auth/AuthProvider';
-import { listenActiveSosRequests, acceptSosRequest, updateAssignment, type SosRequestDoc } from '../../data/sos';
+import { listenActiveSosRequests, acceptSosRequest, removeHelperFromSos, updateAssignment, type SosRequestDoc } from '../../data/sos';
 import { rewardHelperPoints } from '../../data/user';
 import { LocationSearchModal } from '../../components/LocationSearchModal';
 import { useSharedLocation, hasGrantedGPS } from '../../hooks/useSharedLocation';
@@ -69,6 +69,22 @@ export const HelpPage = () => {
   const [accepted, setAccepted] = useState<Record<string, string>>({});
   const [completed, setCompleted] = useState<Set<string>>(new Set());
   const [toast, setToast] = useState<string | null>(null);
+  // ── Part 4: track SOS IDs where helper became >5km (show inline warning) ─
+  const [tooFarSosIds, setTooFarSosIds] = useState<Set<string>>(new Set());
+  const removingRef = useRef<Set<string>>(new Set()); // prevents duplicate removeHelperFromSos calls
+
+  // ── Redirect to login if user is not authenticated ──
+  useEffect(() => {
+    if (!user) nav('/login?redirect=/app/help');
+  }, [user, nav]);
+
+  // Use the authenticated user's ID
+  const helperUid = user?.uid ?? '';
+
+  // Debug log — check console to confirm different IDs per browser profile
+  useEffect(() => {
+    console.log('[I Can Help] helperUid:', helperUid);
+  }, [helperUid]);
 
   // IMPORTANT: Use a SEPARATE storage key so HelpPage location is fully
   // independent from SosPage. Changes to SOS location won't affect this.
@@ -76,19 +92,24 @@ export const HelpPage = () => {
   const [isLocating, setIsLocating] = useState(true);
   const [showManual, setShowManual] = useState(false);
 
-  // ── On mount: silently try GPS. Don’t wipe existing location (persists per session) ──
+  // ── On mount: silently try GPS. Don't wipe existing location (persists per session) ──
   useEffect(() => {
-    // If GPS was previously granted, this silently refreshes to live location.
-    // If permission is 'prompt', it returns null (no popup) and keeps existing location.
-    // showAlert:false = if denied, just show UI banner, no intrusive alert popup.
     requestGPS({ silent: false, showAlert: false }).finally(() => setIsLocating(false));
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Redirect if not logged in; listen to SOS feed
+  // Listen to SOS feed — available to ALL users including guests
   useEffect(() => {
-    if (!user) { nav('/login?redirect=/app/help'); return; }
-    return listenActiveSosRequests(setFeed);
-  }, [user, nav]);
+    return listenActiveSosRequests((data) => {
+      // Filter: exclude own requests + discard docs older than 30 minutes
+      const now = Date.now();
+      const fresh = data.filter(r =>
+        r.victimId !== helperUid &&
+        ((r as any)._createdMs ? now - (r as any)._createdMs < 30 * 60 * 1000 : true)
+      );
+      console.log('[HELPER] Visible SOS after filtering:', fresh.length);
+      setFeed(fresh);
+    });
+  }, [helperUid]);
 
   // Sync helper location to all active assignments
   useEffect(() => {
@@ -103,6 +124,39 @@ export const HelpPage = () => {
     });
   }, [currentLocation, locStatus, accepted]);
 
+  // ── Part 4: remove helper when location update puts them >5km away ────────
+  useEffect(() => {
+    if (!currentLocation || Object.keys(accepted).length === 0) return;
+
+    Object.keys(accepted).forEach(sosRequestId => {
+      // Find the SOS in feed to get its location
+      const sos = feed.find(r => r.id === sosRequestId);
+      if (!sos?.location) return;
+
+      const dist = getDistance(
+        currentLocation.lat,
+        currentLocation.lon,
+        sos.location.lat,
+        sos.location.lon
+      );
+
+      if (dist > 5.0 && !tooFarSosIds.has(sosRequestId) && !removingRef.current.has(sosRequestId)) {
+        removingRef.current.add(sosRequestId);
+        console.log('[HELPER] ❌ Too far from SOS', sosRequestId, '— removing from helpersAccepted');
+        removeHelperFromSos(sosRequestId, helperUid).catch(console.warn);
+        setTooFarSosIds(prev => new Set(prev).add(sosRequestId));
+        // Un-accept locally so the "Help Now" button reappears
+        setAccepted(prev => {
+          const next = { ...prev };
+          delete next[sosRequestId];
+          return next;
+        });
+        showToast('❌ You are no longer near this emergency');
+      }
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentLocation?.lat, currentLocation?.lon]);
+
   const showToast = (msg: string) => {
     setToast(msg);
     setTimeout(() => setToast(null), 2500);
@@ -114,32 +168,41 @@ export const HelpPage = () => {
       setShowManual(true);
       return;
     }
-    if (!user) { nav('/login'); return; }
     let assignmentId = `demo-${Date.now()}`;
     try {
-      assignmentId = await acceptSosRequest({ requestId: req.id, victimId: req.victimId, helperId: user.uid });
-    } catch { /* demo fallback */ }
+      console.log('[I Can Help] Accepting SOS as helperId:', helperUid);
+      assignmentId = await acceptSosRequest({ requestId: req.id, victimId: req.victimId, helperId: helperUid });
+    } catch (e) {
+      console.error('[I Can Help] Accept failed:', e);
+      /* demo fallback */
+    }
     setAccepted(s => ({ ...s, [req.id]: assignmentId }));
     showToast('✅ Accepted — head to the location now!');
   };
 
-  // Compute distances and filter to 5km radius
+  // ── Part 5 / 7: 30-min freshness filter is already applied in sos.ts listener
+  // Compute distances — show ONLY requests <= 5km where victim has valid location
   const items = feed
-    .map(req => {
-      const loc = req.location ?? { lat: 28.6139, lon: 77.209 };
-      const dist = currentLocation
-        ? getDistance(currentLocation.lat, currentLocation.lon, loc.lat, loc.lon)
-        : NaN;
-      return { ...req, dist, loc };
+    .filter(req => {
+      if (!req.location || !req.hasValidLocation || !currentLocation) return false;
+      const d = getDistance(
+        currentLocation.lat, currentLocation.lon,
+        req.location.lat,   req.location.lon
+      );
+      return d <= 5.0;
     })
-    .filter(req => isNaN(req.dist) || req.dist <= 5.0)
+    .map(req => {
+      const dist = getDistance(
+        currentLocation!.lat, currentLocation!.lon,
+        req.location!.lat,   req.location!.lon
+      );
+      return { ...req, dist, loc: req.location };
+    })
     .sort((a, b) =>
       sort === 'urgent'
         ? (a.severity === 'critical' ? -1 : 1)
-        : (isNaN(a.dist) ? 999 : a.dist) - (isNaN(b.dist) ? 999 : b.dist)
+        : a.dist - b.dist
     );
-
-  if (!user) return null;
 
   return (
     <div className="min-h-full bg-[#0a0b0f] flex flex-col max-w-lg mx-auto w-full">
@@ -329,10 +392,12 @@ export const HelpPage = () => {
                   {items.map((req, i) => {
                     const u = URGENCY[req.severity] ?? DEFAULT_URGENCY;
                     const distKm = isNaN(req.dist) ? null : req.dist;
-                    const distLabel = distKm === null ? '—' : distKm < 1 ? `${Math.round(distKm * 1000)}m` : `${distKm.toFixed(1)} km`;
+                    const distLabel = distKm === null ? 'Location pending' : distKm < 1 ? `${Math.round(distKm * 1000)}m` : `${distKm.toFixed(1)} km`;
                     const isAccepted = req.id in accepted;
                     const isComplete = completed.has(req.id);
-                    const rloc = req.location ?? { lat: 28.6139, lon: 77.209 };
+                    // ── Part 4: was previously accepted but removed because now >5km ─────
+                    const isTooFar = tooFarSosIds.has(req.id) && !isAccepted;
+                    const rloc = req.loc;
                     const createdMs = (req as unknown as { createdAt?: { seconds?: number } }).createdAt?.seconds
                       ? (req as unknown as { createdAt: { seconds: number } }).createdAt.seconds * 1000
                       : Date.now();
@@ -367,19 +432,40 @@ export const HelpPage = () => {
                             </div>
                             <span className="text-xs font-black text-emerald-400 animate-pulse">+200 pts</span>
                           </div>
+                        ) : isTooFar ? (
+                          // ── Part 4: too-far warning ─────────────────────────────────────────
+                          <div className="space-y-2">
+                            <div className="flex items-start gap-2 rounded-2xl border border-red-500/25 bg-red-500/[0.08] px-3 py-2.5">
+                              <AlertTriangle className="h-4 w-4 text-red-400 shrink-0 mt-0.5" />
+                              <span className="text-xs font-bold text-red-300">
+                                ❌ You are no longer near this emergency
+                              </span>
+                            </div>
+                            <button onClick={() => void handleHelp(req)}
+                              className="w-full h-10 rounded-2xl text-xs font-black text-white transition active:scale-95"
+                              style={{ background: 'linear-gradient(135deg,#1d4ed8,#1e3a8a)' }}>
+                              Move closer & Re-accept
+                            </button>
+                          </div>
                         ) : isAccepted ? (
                           <div className="space-y-3 pt-2">
-                            {/* OSM Map — no API key needed */}
-                            <div className="relative h-40 rounded-2xl bg-[#0c1420] overflow-hidden border border-white/5">
-                              <OsmMap lat={rloc.lat} lon={rloc.lon} />
-                              <div className="absolute bottom-2 inset-x-2 flex gap-2">
-                                <a href={`https://maps.google.com/?q=${rloc.lat},${rloc.lon}`}
-                                  target="_blank" rel="noreferrer"
-                                  className="flex-1 rounded-xl bg-white/10 backdrop-blur-md border border-white/10 text-[10px] font-bold text-white flex items-center justify-center py-2 h-9 hover:bg-white/20 transition">
-                                  Open in Google Maps
-                                </a>
+                            {/* OSM Map — only shown when we have a real location */}
+                            {rloc ? (
+                              <div className="relative h-40 rounded-2xl bg-[#0c1420] overflow-hidden border border-white/5">
+                                <OsmMap lat={rloc.lat} lon={rloc.lon} />
+                                <div className="absolute bottom-2 inset-x-2 flex gap-2">
+                                  <a href={`https://maps.google.com/?q=${rloc.lat},${rloc.lon}`}
+                                    target="_blank" rel="noreferrer"
+                                    className="flex-1 rounded-xl bg-white/10 backdrop-blur-md border border-white/10 text-[10px] font-bold text-white flex items-center justify-center py-2 h-9 hover:bg-white/20 transition">
+                                    Open in Google Maps
+                                  </a>
+                                </div>
                               </div>
-                            </div>
+                            ) : (
+                              <div className="rounded-2xl border border-amber-500/20 bg-amber-500/[0.06] px-4 py-3 text-[10px] text-amber-300/70">
+                                ⚠ Location not yet available — head to the area and stay alert.
+                              </div>
+                            )}
                             <button onClick={async () => {
                               if (user) {
                                 try { await rewardHelperPoints(user.uid, 200); } catch { /* demo */ }

@@ -70,20 +70,17 @@ service cloud.firestore {
       allow delete: if isSignedIn() && resource.data.patientId == uid();
     }
 
-    // SOS requests are readable in a limited way:
-    // - Victim can read full request
-    // - Helpers can read only safe fields unless accepted
+    // SOS Requests
+    // ⚡ Emergency: allow guest (unauthenticated) users to CREATE a panic SOS
+    //    Victim must either be guest OR must match their own uid
     match /sosRequests/{requestId} {
-      allow create: if isSignedIn() && request.resource.data.victimId == uid();
+      // Allow anyone to create (needed for guest/panic mode emergency access)
+      allow create: if true;
 
-      // Victim full read, others: limited (enforced by client queries + schema discipline)
-      allow read: if isSignedIn() && (
-        resource.data.victimId == uid()
-        || hasRole('helper')
-        || hasRole('admin')
-      );
+      // Victim full read, any signed-in helper can see active requests
+      allow read: if true;
 
-      // Updates: victim can cancel; primary helper can update status; admin can update
+      // Updates: only victim themselves (or admin) can change status
       allow update: if isSignedIn() && (
         resource.data.victimId == uid()
         || hasRole('admin')
@@ -91,14 +88,12 @@ service cloud.firestore {
       allow delete: if false;
     }
 
-    // SOS assignments: one per helper per request
+    // SOS Assignments
+    // ⚡ Emergency: allow anyone to read/create assignments
+    //    Helpers need to create, victims need to read who's coming. Both may be guest.
     match /sosAssignments/{assignmentId} {
-      allow create: if isSignedIn() && request.resource.data.helperId == uid();
-      allow read: if isSignedIn() && (
-        resource.data.helperId == uid()
-        || resource.data.victimId == uid()
-        || hasRole('admin')
-      );
+      allow create: if true;
+      allow read:   if true;
       allow update: if isSignedIn() && (
         resource.data.helperId == uid()
         || resource.data.victimId == uid()

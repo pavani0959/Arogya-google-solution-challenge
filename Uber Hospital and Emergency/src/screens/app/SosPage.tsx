@@ -3,15 +3,15 @@ import { Link, useNavigate } from 'react-router-dom';
 import { Phone, X, CheckCircle2, ChevronDown, ChevronUp, MapPin, Search } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { LocationSearchModal } from '../../components/LocationSearchModal';
-import { useSharedLocation, isLocationFresh, hasGrantedGPS } from '../../hooks/useSharedLocation';
+import { useSharedLocation, hasGrantedGPS } from '../../hooks/useSharedLocation';
 import { useAuth } from '../../auth/AuthProvider';
 import {
   createSosRequest,
+  getActiveSosForUser,
   listenAssignmentsForRequest,
   updateSosRequest,
   listenCurrentSosRequest,
   type SosAssignmentDoc,
-  type SosRequestDoc,
 } from '../../data/sos';
 
 const COUNTDOWN_SECONDS = 8;
@@ -27,20 +27,23 @@ export const SosPage = () => {
   const nav = useNavigate();
   const { user } = useAuth();
 
-  // ── Per-tab guest UID so ghost-SOS doesn't bleed across tabs ──────────────
+  // ── Stable guest UID stored in localStorage (survives refreshes + tabs) ───
   const [guestId] = useState(() => {
-    let gid = sessionStorage.getItem('guest_uid');
+    let gid = localStorage.getItem('arogya_guest_uid');
     if (!gid) {
       gid = 'guest-' + Math.random().toString(36).substring(2, 11);
-      sessionStorage.setItem('guest_uid', gid);
+      localStorage.setItem('arogya_guest_uid', gid);
     }
     return gid;
   });
   const uid = user?.uid ?? guestId;
 
-  // ── Core state ─────────────────────────────────────────────────────────────
-  const [request, setRequest] = useState<SosRequestDoc | null>(null);
-  const [loadingReq, setLoadingReq] = useState(true);
+  // ── Core SOS state ────────────────────────────────────────────────────────
+  const [phase, setPhase] = useState<'countdown' | 'active' | 'safe'>('countdown');
+  const [cdown, setCdown] = useState(COUNTDOWN_SECONDS);
+  const [sosId, setSosId] = useState<string | null>(null);
+  const [sosLocation, setSosLocation] = useState<{ lat: number; lon: number } | null>(null);
+  const [noLocationMode, setNoLocationMode] = useState(false);
   const [assignments, setAssignments] = useState<SosAssignmentDoc[]>([]);
   const [showManual, setShowManual] = useState(false);
   const [showHelplines, setShowHelplines] = useState(false);
@@ -48,175 +51,188 @@ export const SosPage = () => {
   const [toast, setToast] = useState<string | null>(null);
   const [isLocating, setIsLocating] = useState(true);
 
-  // ── Critical flag: when user cancels/resolves, block ALL state updates ────
-  const isDoneRef = useRef(false);
+  const isDoneRef = useRef(false);    // blocks all state updates after cancel/resolve
+  const createdRef = useRef(false);   // prevents duplicate Firestore writes
+  // ── Part 2: throttle location-sync writes to max 1 per 5 seconds ─────────
+  const lastLocUpdateRef = useRef(0);
 
-  const { currentLocation, saveLocation, requestGPS, locStatus, clearLocation } = useSharedLocation();
+  const { currentLocation, saveLocation, requestGPS, clearLocation } = useSharedLocation();
 
-  // ── Toast helper (defined early so .catch() can use it) ───────────────────
+  // ── Toast helper ──────────────────────────────────────────────────────────
   const showToast = useCallback((msg: string) => {
     setToast(msg);
     setTimeout(() => setToast(null), 3000);
   }, []);
 
-  // ── Start SOS fresh EVERY time ──────────────────────────────────────────
+  // ── Mount: clear stale location, auto-connect GPS ─────────────────────────
   useEffect(() => {
-    // ✅ Wipe only manual/stale locations, keep nothing cached
     clearLocation();
-    // ✅ Use silent:false so if they already GRANTED permission, GPS auto-connects
-    //    showAlert:false means denied state shows UI banner, not an annoying popup
     requestGPS({ silent: false, showAlert: false }).finally(() => setIsLocating(false));
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Listen to backend SOS for this uid ────────────────────────────────────
+  // ── Resume check: if user already has an active SOS, skip countdown ───────
   useEffect(() => {
-    const timeout = setTimeout(() => setLoadingReq(false), 3000);
-
-    const unsub = listenCurrentSosRequest(uid, (req) => {
-      clearTimeout(timeout);
-      // If user already clicked cancel/safe, ignore ALL Firestore updates
-      if (isDoneRef.current) return;
-
-      setRequest(prev => {
-        // Don't let the server roll the countdown backward
-        if (prev && req && prev.status === 'countdown' && req.status === 'countdown') {
-          if (prev.countdown < req.countdown) {
-            return { ...req, countdown: prev.countdown };
-          }
-        }
-        return req;
-      });
-      setLoadingReq(false);
+    const unsub = listenCurrentSosRequest(uid, (existing) => {
+      unsub(); // one-time check only
+      if (!existing || isDoneRef.current || createdRef.current) return;
+      if (existing.status !== 'active') return;
+      console.log('[SOS] Resuming existing active SOS:', existing.id);
+      createdRef.current = true;
+      setSosId(existing.id);
+      setSosLocation(existing.location ?? null);
+      setNoLocationMode(!existing.hasValidLocation);
+      setPhase('active');
+      setCdown(0);
     });
+    return unsub;
+  }, [uid]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    return () => { clearTimeout(timeout); unsub(); };
-  }, [uid]);
-
-  // ── Create SOS optimistically when no active request found ───────────────
+  // ── LOCAL COUNTDOWN — zero Firestore writes during this phase ────────────
   useEffect(() => {
-    if (loadingReq || request || isDoneRef.current) return;
+    if (phase !== 'countdown') return;
+    const timer = setInterval(() => {
+      if (isDoneRef.current) { clearInterval(timer); return; }
+      setCdown(prev => {
+        if (prev <= 1) { clearInterval(timer); return 0; }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [phase]);
 
+  // ── SOS creation — evaluates finalLocation at countdown=0 ─────────────────
+  // Keep a ref so the effect below always calls the LATEST version
+  // (capturing the latest currentLocation value at fire time).
+  const createSosRef = useRef<(() => Promise<void>) | undefined>(undefined);
+
+  const createSos = useCallback(async () => {
+    // ── FINAL LOCATION PRIORITY CHAIN ────────────────────────────────────────
     const params = new URLSearchParams(window.location.search);
     const hwLat = params.get('lat');
     const hwLon = params.get('lon');
-    const hardwareLocation = hwLat
-      ? { lat: Number(hwLat), lon: Number(hwLon) }
-      : null;
+    const now = Date.now();
 
-    let finalLocation: { lat: number; lon: number } | null = null;
-    let hasValidLocation = false;
+    let finalLocation: { lat: number; lon: number; isApproximate?: boolean } | null = null;
 
-    if (hardwareLocation) {
-      finalLocation = hardwareLocation;
-      hasValidLocation = true;
-    } else if (currentLocation && isLocationFresh(currentLocation.timestamp)) {
+    if (hwLat && hwLon) {
+      // 1. Hardware sensor coordinates (crash detection) — highest priority
+      finalLocation = { lat: Number(hwLat), lon: Number(hwLon) };
+    } else if (currentLocation?.source === 'gps' && now - currentLocation.timestamp < 2 * 60 * 1000) {
+      // 2. Live GPS — fresh within 2 minutes
       finalLocation = { lat: currentLocation.lat, lon: currentLocation.lon };
-      hasValidLocation = true;
-    } else if (currentLocation) {
+    } else if (currentLocation?.source === 'manual') {
+      // 3. Manually selected location
       finalLocation = { lat: currentLocation.lat, lon: currentLocation.lon };
-      hasValidLocation = false;
+    } else if (currentLocation && now - currentLocation.timestamp < 8 * 60 * 1000) {
+      // 4. Last known location — within 8 minutes (marked as approximate)
+      finalLocation = { lat: currentLocation.lat, lon: currentLocation.lon, isApproximate: true };
+    }
+    // else → no location at all (null)
+
+    console.log('SOS location used:', finalLocation);
+
+    const hasValidLoc = finalLocation !== null;
+    setNoLocationMode(!hasValidLoc);
+    setSosLocation(finalLocation ? { lat: finalLocation.lat, lon: finalLocation.lon } : null);
+
+    try {
+      const saved = await createSosRequest({
+        victimId: uid,
+        status: 'active',         // written directly as 'active' — no countdown in Firestore
+        severity: hwLat ? 'critical' : 'major',
+        source: hwLat ? 'hardware' : 'mobile',
+        countdown: 0,
+        location: finalLocation ? { lat: finalLocation.lat, lon: finalLocation.lon } : null,
+        hasValidLocation: hasValidLoc,
+        isApproximate: finalLocation?.isApproximate ?? false,
+        radiusKm: 5,
+      });
+      console.log('[SOS] ✅ Saved to Firestore as active:', saved.id, '| location:', finalLocation);
+      setSosId(saved.id);
+    } catch (err) {
+      console.error('[SOS] ❌ Firestore write FAILED:', err);
+      showToast('SOS sent (offline mode — check console for error)');
     }
 
-    const optimisticReq: SosRequestDoc = {
-      id: `local-${Date.now()}`,
-      status: 'countdown',
-      severity: hardwareLocation ? 'critical' : 'major',
-      source: hardwareLocation ? 'hardware' : 'mobile',
-      countdown: COUNTDOWN_SECONDS,
-      location: finalLocation,
-      hasValidLocation,
-      radiusKm: 1.5,
-      victimId: uid,
-    };
+    setPhase('active');
+  }, [uid, currentLocation, showToast]);
 
-    setRequest(optimisticReq);
+  // Keep ref in sync so effect below always calls the latest createSos
+  useEffect(() => { createSosRef.current = createSos; }, [createSos]);
 
-    createSosRequest(optimisticReq)
-      .then((saved) => {
-        if (isDoneRef.current) return;
-        // Only update the ID — preserve the live local countdown
-        setRequest(prev => {
-          if (!prev || isDoneRef.current) return prev;
-          return { ...prev, id: saved.id };
-        });
-      })
-      .catch(() => showToast('Using offline/demo SOS logic.'));
-  }, [loadingReq, request, uid, currentLocation, showToast]);
-
-  // ── Local countdown fallback (runs when status === 'countdown') ───────────
+  // ── Fire createSos exactly once when countdown hits zero ──────────────────
   useEffect(() => {
-    if (request?.status !== 'countdown') return;
+    if (cdown !== 0 || phase !== 'countdown' || createdRef.current || isDoneRef.current) return;
+    createdRef.current = true;
+    void createSosRef.current?.();
+  }, [cdown, phase]);
 
-    const timer = setInterval(() => {
-      if (isDoneRef.current) { clearInterval(timer); return; }
-
-      setRequest(prev => {
-        if (!prev || prev.status !== 'countdown' || isDoneRef.current) return prev;
-        const newCdown = prev.countdown - 1;
-        if (newCdown <= 0) {
-          return { ...prev, countdown: 0, status: 'active' };
-        }
-        return { ...prev, countdown: newCdown };
-      });
-    }, 1000);
-
-    return () => clearInterval(timer);
-  }, [request?.status]);
-
-  // ── Listen to helper assignments for this request ─────────────────────────
+  // ── LOCATION SYNC: patch Firestore when location changes while SOS is active
+  // Throttled: max 1 write per 5 seconds. Deduped: skips if coords unchanged.
   useEffect(() => {
-    if (!request?.id || request.id.startsWith('local-')) return;
-    return listenAssignmentsForRequest(request.id, setAssignments);
-  }, [request?.id]);
+    if (phase !== 'active' || !sosId || isDoneRef.current || !currentLocation) return;
 
-  // Auto-dial removed — user must manually tap the call button
+    // ── Part 2: throttle ─────────────────────────────────────────────────────
+    const now = Date.now();
+    if (now - lastLocUpdateRef.current < 5000) return;
 
-  // ── Derived UI phase ──────────────────────────────────────────────────────
-  const phase =
-    request?.status === 'resolved' ? 'safe'
-    : request?.status === 'active' ? 'active'
-    : 'countdown';
-  const cdown = request?.countdown ?? COUNTDOWN_SECONDS;
+    const newLoc = { lat: currentLocation.lat, lon: currentLocation.lon };
+    const isSame =
+      sosLocation &&
+      Math.abs(sosLocation.lat - newLoc.lat) < 0.0001 &&
+      Math.abs(sosLocation.lon - newLoc.lon) < 0.0001;
 
-  // ── NAVIGATION HELPERS — navigate FIRST, update Firebase in background ────
+    if (isSame) return;
+
+    lastLocUpdateRef.current = now;
+    console.log('[SOS] 📍 Location updated (throttled) — patching Firestore:', newLoc);
+    setSosLocation(newLoc);
+    setNoLocationMode(false);
+    updateSosRequest(sosId, { location: newLoc, hasValidLocation: true, isApproximate: false, lastUpdated: now })
+      .then(() => console.log('[SOS] ✅ Firestore location patched to:', newLoc))
+      .catch((e) => console.error('[SOS] ❌ Patch failed:', e));
+  }, [currentLocation, phase, sosId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Listen to helper assignments for this SOS ─────────────────────────────
+  useEffect(() => {
+    if (!sosId) return;
+    return listenAssignmentsForRequest(sosId, setAssignments, uid);
+  }, [sosId, uid]);
+
+  // ── NAVIGATION HELPERS ────────────────────────────────────────────────────
   const goHome = useCallback(() => {
     nav(user ? '/app' : '/', { replace: true });
   }, [nav, user]);
 
   const cancelAlert = useCallback(() => {
-    isDoneRef.current = true;                          // Block all future state updates
-    const reqId = request?.id;
-    setRequest(null);                                 // Clear UI immediately
+    isDoneRef.current = true;
     showToast('Alert cancelled.');
-    if (reqId && !reqId.startsWith('local-')) {
-      sessionStorage.setItem(`ignore_sos_${reqId}`, 'true');
-      updateSosRequest(reqId, { status: 'cancelled' }).catch(console.warn);
+    if (sosId) {
+      sessionStorage.setItem(`ignore_sos_${sosId}`, 'true');
+      updateSosRequest(sosId, { status: 'cancelled' }).catch(console.warn);
     }
     goHome();
-  }, [request?.id, showToast, goHome]);
+  }, [sosId, showToast, goHome]);
 
   const stopAlert = useCallback(() => {
     isDoneRef.current = true;
-    const reqId = request?.id;
-    setRequest(null);
-    if (reqId && !reqId.startsWith('local-')) {
-      sessionStorage.setItem(`ignore_sos_${reqId}`, 'true');
-      updateSosRequest(reqId, { status: 'cancelled' }).catch(console.warn);
+    if (sosId) {
+      sessionStorage.setItem(`ignore_sos_${sosId}`, 'true');
+      updateSosRequest(sosId, { status: 'cancelled' }).catch(console.warn);
     }
     goHome();
-  }, [request?.id, goHome]);
+  }, [sosId, goHome]);
 
   const markSafe = useCallback(() => {
     isDoneRef.current = true;
-    const reqId = request?.id;
-    setRequest(null);
     showToast('You are safe! Notifying helpers…');
-    if (reqId && !reqId.startsWith('local-')) {
-      sessionStorage.setItem(`ignore_sos_${reqId}`, 'true');
-      updateSosRequest(reqId, { status: 'resolved' }).catch(console.warn);
+    if (sosId) {
+      sessionStorage.setItem(`ignore_sos_${sosId}`, 'true');
+      updateSosRequest(sosId, { status: 'resolved' }).catch(console.warn);
     }
+    setPhase('safe');
     setTimeout(goHome, 1800);
-  }, [request?.id, showToast, goHome]);
+  }, [sosId, showToast, goHome]);
 
   const simulateVoiceFallback = () => {
     const speech = new SpeechSynthesisUtterance(
@@ -228,7 +244,8 @@ export const SosPage = () => {
 
   const pct = ((COUNTDOWN_SECONDS - cdown) / COUNTDOWN_SECONDS) * 100;
   const circumference = 2 * Math.PI * 54;
-  const displayCoords = request?.source === 'hardware' ? request.location : (currentLocation || null);
+  // Display priority: confirmed SOS location → live GPS → null
+  const displayCoords = sosLocation ?? (currentLocation ? { lat: currentLocation.lat, lon: currentLocation.lon } : null);
 
   return (
     <div className="min-h-dvh bg-[#0a0b0f] flex flex-col overflow-hidden">
@@ -300,7 +317,7 @@ export const SosPage = () => {
           );
         }
 
-        // State 2: Fresh live GPS → green banner with real coordinates
+        // State 2: Fresh live GPS → green banner
         if (isFresh && currentLocation.source === 'gps') {
           return (
             <motion.div initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }} className="w-full shrink-0">
@@ -330,7 +347,7 @@ export const SosPage = () => {
           );
         }
 
-        // State 3: Have location but it's stale (permission was given, GPS now off) or manual
+        // State 3: Stale or manual location
         return (
           <motion.div
             initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }}
@@ -349,7 +366,7 @@ export const SosPage = () => {
                 </div>
               </div>
             </div>
-            
+
             <button
               onClick={() => void requestGPS()}
               className="w-full flex items-center gap-4 px-5 py-3 text-left transition active:brightness-90"
@@ -429,7 +446,7 @@ export const SosPage = () => {
               {/* Status checklist */}
               <div className="mt-8 w-full max-w-xs space-y-2">
                 {[
-                  { done: currentLocation !== null || request?.source === 'hardware', label: 'Detecting location' },
+                  { done: currentLocation !== null, label: 'Detecting location' },
                   { done: cdown < 6, label: 'Preparing alert data' },
                   { done: cdown < 3, label: 'Finding nearby helpers' },
                 ].map((item, i) => (
@@ -492,17 +509,32 @@ export const SosPage = () => {
             </div>
 
             <div className="px-5 pb-6 space-y-4 flex-1">
+              {/* No-location warning banner — shown when SOS created without GPS or manual location */}
+              {noLocationMode && (
+                <div className="rounded-3xl border border-amber-500/30 bg-amber-500/[0.08] p-4">
+                  <div className="flex items-start gap-3">
+                    <MapPin className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
+                    <div>
+                      <div className="text-xs font-black text-amber-300">⚠ Location not found</div>
+                      <div className="text-[10px] text-amber-300/60 mt-1 leading-relaxed">
+                        Notifying ambulance only. Enable GPS or select location manually to alert nearby helpers.
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* Status */}
               <div className="rounded-3xl border border-white/[0.06] bg-[#13141a] p-4 space-y-3">
                 <div className="text-[10px] font-bold text-white/30 uppercase tracking-widest">Status</div>
                 {[
                   'Ambulance notified',
                   'Emergency contacts alerted',
-                  'Nearby helpers notified',
+                  noLocationMode ? '🔒 Nearby helpers — location required' : 'Nearby helpers notified',
                 ].map((label, i) => (
                   <div key={i} className="flex items-center gap-3">
-                    <CheckCircle2 className="h-5 w-5 shrink-0 text-emerald-400" />
-                    <span className="text-sm font-semibold text-white/80">{label}</span>
+                    <CheckCircle2 className={`h-5 w-5 shrink-0 ${i === 2 && noLocationMode ? 'text-amber-400' : 'text-emerald-400'}`} />
+                    <span className={`text-sm font-semibold ${i === 2 && noLocationMode ? 'text-amber-300/70' : 'text-white/80'}`}>{label}</span>
                   </div>
                 ))}
 

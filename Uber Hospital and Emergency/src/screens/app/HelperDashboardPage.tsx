@@ -1,24 +1,37 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { HandHeart, Trophy, CheckCircle2, Clock } from 'lucide-react';
+import { HandHeart, Trophy, CheckCircle2, Clock, MapPin, AlertTriangle } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useAuth } from '../../auth/AuthProvider';
 import { listenActiveSosRequests, acceptSosRequest, type SosRequestDoc } from '../../data/sos';
 
 type Tab = 'need-help' | 'leaderboard';
 
+// ── Haversine formula — returns distance in km ────────────────────────────
+function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * (Math.PI / 180);
+  const dLon = (lon2 - lon1) * (Math.PI / 180);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * (Math.PI / 180)) * Math.cos(lat2 * (Math.PI / 180)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
 const URGENCY_COLORS = {
   critical: { bg: 'bg-red-500/15', border: 'border-red-500/25', text: 'text-red-300', label: 'High' },
-  high: { bg: 'bg-amber-500/15', border: 'border-amber-500/25', text: 'text-amber-300', label: 'Medium' },
-  low: { bg: 'bg-emerald-500/15', border: 'border-emerald-500/25', text: 'text-emerald-300', label: 'Low' },
+  major:    { bg: 'bg-amber-500/15', border: 'border-amber-500/25', text: 'text-amber-300', label: 'Medium' },
+  high:     { bg: 'bg-amber-500/15', border: 'border-amber-500/25', text: 'text-amber-300', label: 'Medium' },
+  minor:    { bg: 'bg-emerald-500/15', border: 'border-emerald-500/25', text: 'text-emerald-300', label: 'Low' },
+  low:      { bg: 'bg-emerald-500/15', border: 'border-emerald-500/25', text: 'text-emerald-300', label: 'Low' },
 };
 
 const LEADERBOARD_DEMO = [
-  { rank: 1, name: 'Priya S.', phone: '9876…', helped: 24, points: 4800 },
-  { rank: 2, name: 'Arjun M.', phone: '9123…', helped: 19, points: 3800 },
-  { rank: 3, name: 'Sneha R.', phone: '9345…', helped: 15, points: 3000 },
-  { rank: 4, name: 'Vikram K.', phone: '9567…', helped: 11, points: 2200 },
-  { rank: 5, name: 'Meera T.', phone: '9234…', helped: 8, points: 1600 },
+  { rank: 1, name: 'Priya S.',   helped: 24, points: 4800 },
+  { rank: 2, name: 'Arjun M.',  helped: 19, points: 3800 },
+  { rank: 3, name: 'Sneha R.',  helped: 15, points: 3000 },
+  { rank: 4, name: 'Vikram K.', helped: 11, points: 2200 },
+  { rank: 5, name: 'Meera T.',  helped: 8,  points: 1600 },
 ];
 
 export const HelperDashboardPage = () => {
@@ -28,42 +41,76 @@ export const HelperDashboardPage = () => {
   const [feed, setFeed] = useState<SosRequestDoc[]>([]);
   const [acceptedId, setAcceptedId] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
-  const [locationRequested, setLocationRequested] = useState(false);
+  const [tooFarWarning, setTooFarWarning] = useState(false);
 
-  // Request location permission when this page loads (not at app start)
-  useEffect(() => {
-    if (locationRequested) return;
-    setLocationRequested(true);
-    if (navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(() => {}, () => {});
-    }
-  }, [locationRequested]);
+  // ── Helper's own GPS coordinates ─────────────────────────────────────────
+  const [helperLat, setHelperLat] = useState<number | null>(null);
+  const [helperLon, setHelperLon] = useState<number | null>(null);
+  const [locStatus, setLocStatus] = useState<'pending' | 'ok' | 'denied'>('pending');
+
+  const showToast = useCallback((msg: string) => {
+    setToast(msg);
+    setTimeout(() => setToast(null), 3000);
+  }, []);
 
   // Redirect to login if not authenticated
   useEffect(() => {
-    if (!user) {
-      nav('/login?redirect=/app/helper');
-    }
+    if (!user) nav('/login?redirect=/app/helper');
   }, [user, nav]);
 
+  // ── Acquire helper's GPS location for distance-based filtering ────────────
+  useEffect(() => {
+    if (!navigator.geolocation) { setLocStatus('denied'); return; }
+    navigator.geolocation.getCurrentPosition(
+      (p) => {
+        setHelperLat(p.coords.latitude);
+        setHelperLon(p.coords.longitude);
+        setLocStatus('ok');
+      },
+      () => setLocStatus('denied'),
+      { enableHighAccuracy: true, timeout: 12000 }
+    );
+  }, []);
+
+  // ── Listen to ALL active SOS requests from Firestore ─────────────────────
+  // Client-side filtering handles: hasValidLocation check + 5 km radius
   useEffect(() => {
     return listenActiveSosRequests(setFeed);
   }, []);
 
-  const showToast = (msg: string) => {
-    setToast(msg);
-    setTimeout(() => setToast(null), 2500);
-  };
+  // ── Too-far detection: watch accepted SOS location for updates ────────────
+  // CASE 2: accepted helper is now >5 km after victim's location changed
+  const acceptedSos = feed.find(req => req.id === acceptedId) ?? null;
+  useEffect(() => {
+    if (!acceptedSos?.location || helperLat === null || helperLon === null) return;
+    const dist = haversineKm(helperLat, helperLon, acceptedSos.location.lat, acceptedSos.location.lon);
+    if (dist > 5) {
+      setTooFarWarning(true);
+      setAcceptedId(null);
+      showToast('❌ Location changed — you are too far to assist');
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [acceptedSos?.location?.lat, acceptedSos?.location?.lon]);
+
+  // ── Filter logic ──────────────────────────────────────────────────────────
+  // CASE A: helpers only see SOS with hasValidLocation=true
+  // CASE B: filter by 5 km radius when helper location is known
+  // CASE 3: new helpers within 5 km see SOS automatically when feed updates
+  const visibleFeed = feed.filter(req => {
+    if (!req.hasValidLocation || !req.location) return false; // no valid location → never show
+    if (helperLat === null || helperLon === null) return true; // no helper GPS → show all valid
+    return haversineKm(helperLat, helperLon, req.location.lat, req.location.lon) <= 5;
+  });
 
   const handleHelpNow = async (req: SosRequestDoc) => {
     if (!user) { nav('/login'); return; }
     try {
       await acceptSosRequest({ requestId: req.id, victimId: req.victimId, helperId: user.uid });
       setAcceptedId(req.id);
+      setTooFarWarning(false);
       showToast('You accepted this request! Head to the location.');
     } catch {
-      showToast('Accepted (demo mode).');
-      setAcceptedId(req.id);
+      showToast('Failed to accept. Please try again.');
     }
   };
 
@@ -72,12 +119,6 @@ export const HelperDashboardPage = () => {
     const min = Math.floor(diff / 60000);
     return min < 1 ? 'just now' : `${min} min ago`;
   };
-
-  const demoFeed: SosRequestDoc[] = feed.length > 0 ? feed : [
-    { id: 'd1', victimId: 'usr1', status: 'active', severity: 'critical', location: { lat: 28.614, lon: 77.21 }, radiusKm: 1.5, primaryHelperId: null, createdAt: Date.now() - 60000 * 2 } as any,
-    { id: 'd2', victimId: 'usr2', status: 'active', severity: 'high', location: { lat: 28.618, lon: 77.215 }, radiusKm: 1.2, primaryHelperId: null, createdAt: Date.now() - 60000 * 5 } as any,
-    { id: 'd3', victimId: 'usr3', status: 'active', severity: 'low', location: { lat: 28.611, lon: 77.204 }, radiusKm: 0.8, primaryHelperId: null, createdAt: Date.now() - 60000 * 12 } as any,
-  ];
 
   if (!user) return null;
 
@@ -110,6 +151,24 @@ export const HelperDashboardPage = () => {
             <h1 className="text-xl font-black text-white">I Can Help</h1>
             <p className="text-xs text-white/35">Respond to nearby emergencies</p>
           </div>
+        </div>
+
+        {/* Helper location status indicator */}
+        <div className="mt-3 flex items-center gap-2">
+          <MapPin className={`h-3 w-3 shrink-0 ${
+            locStatus === 'ok' ? 'text-emerald-400' :
+            locStatus === 'denied' ? 'text-amber-400' : 'text-white/25'
+          }`} />
+          <span className={`text-[10px] ${
+            locStatus === 'ok' ? 'text-emerald-400/70' :
+            locStatus === 'denied' ? 'text-amber-400/70' : 'text-white/25'
+          }`}>
+            {locStatus === 'ok'
+              ? `Your location: ${helperLat?.toFixed(4)}, ${helperLon?.toFixed(4)} — showing SOS within 5 km`
+              : locStatus === 'denied'
+              ? 'Location unavailable — showing all valid SOS requests'
+              : 'Getting your location…'}
+          </span>
         </div>
 
         {/* Tabs */}
@@ -145,9 +204,10 @@ export const HelperDashboardPage = () => {
           {tab === 'need-help' && (
             <motion.div key="feed" initial={{ opacity: 0, x: -10 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 10 }}
               className="space-y-3">
+
               <div className="flex items-center justify-between">
                 <span className="text-[10px] font-bold text-white/25 uppercase tracking-widest">
-                  {demoFeed.length} active request{demoFeed.length !== 1 ? 's' : ''}
+                  {visibleFeed.length} active request{visibleFeed.length !== 1 ? 's' : ''} nearby
                 </span>
                 <div className="flex items-center gap-1.5 text-[10px] text-white/25">
                   <div className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
@@ -155,10 +215,49 @@ export const HelperDashboardPage = () => {
                 </div>
               </div>
 
-              {demoFeed.map((req) => {
+              {/* Too-far warning — shown when victim updated location and helper is now >5 km */}
+              <AnimatePresence>
+                {tooFarWarning && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, height: 0 }}
+                    className="rounded-3xl border border-amber-500/25 bg-amber-500/[0.08] p-4 flex items-start gap-3"
+                  >
+                    <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
+                    <div>
+                      <div className="text-xs font-black text-amber-300">📍 Location changed — you're too far</div>
+                      <div className="text-[10px] text-amber-300/60 mt-0.5 leading-relaxed">
+                        The victim's location was updated and you are now more than 5 km away.
+                        Your assignment was removed. New helpers near the updated location are being notified.
+                      </div>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              {/* Empty state */}
+              {visibleFeed.length === 0 && (
+                <motion.div
+                  initial={{ opacity: 0 }} animate={{ opacity: 1 }}
+                  className="mt-10 text-center space-y-3"
+                >
+                  <div className="text-4xl">✅</div>
+                  <div className="text-sm font-black text-white/50">No emergencies nearby</div>
+                  <div className="text-[10px] text-white/25 max-w-[220px] mx-auto leading-relaxed">
+                    {locStatus === 'ok'
+                      ? 'No active SOS requests within 5 km of your location. You\'ll be notified automatically.'
+                      : 'No active SOS requests with valid location at this time.'}
+                  </div>
+                </motion.div>
+              )}
+
+              {/* SOS cards — only hasValidLocation=true, within 5 km */}
+              {visibleFeed.map((req) => {
                 const urgency = URGENCY_COLORS[req.severity as keyof typeof URGENCY_COLORS] ?? URGENCY_COLORS.low;
                 const isAccepted = acceptedId === req.id;
-                const distKm = ((Math.random() * 2) + 0.3).toFixed(1);
+                const distKm = (helperLat !== null && helperLon !== null && req.location)
+                  ? haversineKm(helperLat, helperLon, req.location.lat, req.location.lon).toFixed(1)
+                  : null;
+
                 return (
                   <motion.div
                     key={req.id}
@@ -170,18 +269,41 @@ export const HelperDashboardPage = () => {
                       <div className="space-y-1">
                         <div className="text-sm font-black text-white">Emergency nearby</div>
                         <div className="flex items-center gap-2 flex-wrap">
-                          <span className="text-[10px] text-white/40">📍 {distKm} km away</span>
+                          <span className="text-[10px] text-white/40">
+                            📍 {distKm !== null ? `${distKm} km away` : 'Distance unknown'}
+                          </span>
                           <span className="text-white/20">•</span>
                           <span className="flex items-center gap-1 text-[10px] text-white/40">
                             <Clock className="h-3 w-3" />
                             {timeAgo((req as any).createdAt ?? Date.now())}
                           </span>
+                          {req.isApproximate && (
+                            <>
+                              <span className="text-white/20">•</span>
+                              <span className="text-[10px] text-amber-400/80">⚠ Approx. location</span>
+                            </>
+                          )}
                         </div>
                       </div>
                       <div className={`shrink-0 rounded-full px-2.5 py-1 text-[10px] font-black ${urgency.text} border ${urgency.border}`}>
                         {urgency.label} Urgency
                       </div>
                     </div>
+
+                    {/* Location coordinates (real, from Firestore) */}
+                    {req.location && (
+                      <div className="flex items-center gap-1.5 text-[10px] text-white/30">
+                        <MapPin className="h-3 w-3 text-white/20 shrink-0" />
+                        {req.location.lat.toFixed(4)}, {req.location.lon.toFixed(4)}
+                        <a
+                          href={`https://maps.google.com/?q=${req.location.lat},${req.location.lon}`}
+                          target="_blank" rel="noreferrer"
+                          className="ml-auto shrink-0 text-blue-400/60 hover:text-blue-400 transition underline underline-offset-2"
+                        >
+                          Open map
+                        </a>
+                      </div>
+                    )}
 
                     {isAccepted ? (
                       <div className="flex items-center gap-2 rounded-2xl border border-emerald-500/20 bg-emerald-500/10 px-3 py-2.5">
@@ -217,7 +339,6 @@ export const HelperDashboardPage = () => {
                     : i === 2 ? 'border-amber-700/20 bg-amber-700/5'
                     : 'border-white/[0.05] bg-white/[0.02]'
                   }`}>
-                  {/* Rank */}
                   <div className={`h-10 w-10 rounded-full flex items-center justify-center shrink-0 text-sm font-black ${
                     i === 0 ? 'bg-amber-500 text-white'
                     : i === 1 ? 'bg-slate-400 text-[#0a0b0f]'
