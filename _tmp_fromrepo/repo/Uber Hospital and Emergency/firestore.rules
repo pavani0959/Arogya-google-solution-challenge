@@ -1,0 +1,120 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function uid() {
+      return request.auth.uid;
+    }
+
+    function hasRole(role) {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/users/$(uid()))
+        && get(/databases/$(database)/documents/users/$(uid())).data.role == role;
+    }
+
+    function isPatientSelf(patientId) {
+      return isSignedIn() && patientId == uid();
+    }
+
+    // Users (public profile + role)
+    match /users/{userId} {
+      allow read: if isSignedIn() && userId == uid();
+      allow create: if isSignedIn() && userId == uid();
+      allow update: if isSignedIn() && userId == uid();
+      allow delete: if false;
+    }
+
+    // Patient profile (we keep patientId = uid for simple rules)
+    match /patients/{patientId} {
+      allow read, create, update: if isPatientSelf(patientId);
+      allow delete: if false;
+    }
+
+    // Hospitals & doctors (admin-managed)
+    match /hospitals/{hospitalId} {
+      allow read: if true;
+      allow write: if hasRole('hospital_admin') || hasRole('admin');
+    }
+
+    match /doctors/{doctorId} {
+      allow read: if true;
+      allow write: if hasRole('hospital_admin') || hasRole('admin') || hasRole('doctor');
+    }
+
+    // Appointments
+    match /appointments/{appointmentId} {
+      allow read: if isSignedIn() && (resource.data.patientId == uid() || resource.data.doctorId == uid());
+      allow create: if isSignedIn() && request.resource.data.patientId == uid();
+      allow update: if isSignedIn()
+        && (
+          resource.data.patientId == uid() // patient can cancel/reschedule their own
+          || resource.data.doctorId == uid() // doctor can mark completed, attach summary
+        );
+      allow delete: if isSignedIn() && resource.data.patientId == uid();
+    }
+
+    // Medical records metadata (files stored in Storage, referenced here)
+    match /medicalRecords/{recordId} {
+      allow read: if isSignedIn() && (
+        resource.data.patientId == uid()
+        || resource.data.doctorId == uid()
+      );
+      allow create: if isSignedIn() && request.resource.data.patientId == uid();
+      allow update: if isSignedIn() && (
+        resource.data.patientId == uid()
+        || resource.data.doctorId == uid()
+      );
+      allow delete: if isSignedIn() && resource.data.patientId == uid();
+    }
+
+    // SOS Requests
+    // ⚡ Emergency: allow guest (unauthenticated) users to CREATE a panic SOS
+    //    Victim must either be guest OR must match their own uid
+    match /sosRequests/{requestId} {
+      // Allow anyone to create (needed for guest/panic mode emergency access)
+      allow create: if true;
+
+      // Victim full read, any signed-in helper can see active requests
+      allow read: if true;
+
+      // Updates: only victim themselves (or admin) can change status
+      allow update: if isSignedIn() && (
+        resource.data.victimId == uid()
+        || hasRole('admin')
+      );
+      allow delete: if false;
+    }
+
+    // SOS Assignments
+    // ⚡ Emergency: allow anyone to read/create assignments
+    //    Helpers need to create, victims need to read who's coming. Both may be guest.
+    match /sosAssignments/{assignmentId} {
+      allow create: if true;
+      allow read:   if true;
+      allow update: if isSignedIn() && (
+        resource.data.helperId == uid()
+        || resource.data.victimId == uid()
+        || hasRole('admin')
+      );
+      allow delete: if false;
+    }
+
+    // Helpers profile
+    match /helpers/{helperId} {
+      allow read: if isSignedIn() && helperId == uid();
+      allow create, update: if isSignedIn() && helperId == uid();
+      allow delete: if false;
+    }
+
+    // Coin ledger is append-only; read limited
+    match /coinLedger/{entryId} {
+      allow read: if isSignedIn() && (resource.data.userId == uid() || hasRole('admin'));
+      allow create: if hasRole('admin'); // in MVP, points awarded via Cloud Functions as admin service
+      allow update, delete: if false;
+    }
+  }
+}
+
