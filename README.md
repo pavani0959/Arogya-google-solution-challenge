@@ -1,5 +1,7 @@
 # ResQMed (Unified) — Uber for Hospitals + Emergency SOS
 
+<img width="1081" height="627" alt="Screenshot 2026-04-24 153209" src="https://github.com/user-attachments/assets/e7565125-bc6d-4704-97d5-2390fd64ed66" />
+
 This repo is the unified project combining the best of both prototypes into a single **Firebase-first** platform:
 
 - **Care mode**: Specialty → Doctor → Hospital → Slot → Appointment
